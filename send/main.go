@@ -1,7 +1,9 @@
 package main
 
 import (
+	"encoding/binary"
 	"fmt"
+	"math/rand"
 	"net"
 	"reflect"
 	"regexp"
@@ -13,15 +15,17 @@ import (
 )
 
 const (
-	dataShards        int = 10
-	parityShards      int = 2
-	defaultMTU        int = 1518
-	defaultListenPort int = 9981
+	dataShards          int = 10
+	parityShards        int = 2
+	defaultMTU          int = 1518
+	defaultHeaderLength int = 3 + 1
+	defaultListenPort   int = 9981
 )
 
 var (
-	interfacesList = []string{"ens33", "ens34"}
-	udpConns       = make([]*net.UDPConn, 0, 2)
+	interfacesList        = []string{"ens33", "ens34"}
+	udpConns              = make([]*net.UDPConn, 0, 2)
+	groupID        uint32 = 0
 )
 
 func bindToDevice(conn net.PacketConn, device string) error {
@@ -82,14 +86,14 @@ func listenLocal(ch chan []byte, localAddr *net.UDPAddr) {
 
 	for {
 		data := make([]byte, defaultMTU)
-		n, remoteAddr, err := listener.ReadFromUDP(data)
+		n, remoteAddr, err := listener.ReadFromUDP(data[defaultHeaderLength:])
 		if err != nil {
 			fmt.Printf("error during read: %s", err)
 			continue
 		}
 		fmt.Printf("<%s> %d bytes\n", remoteAddr, n)
 		select {
-		case ch <- data[:n]:
+		case ch <- data[:n+defaultHeaderLength]:
 			fmt.Println(n, data[:n])
 		default:
 			fmt.Printf("ch is full!\n")
@@ -111,7 +115,15 @@ func calFEC(data [][]byte, dataShards, parityShards int) ([][]byte, error) {
 }
 
 func sendData(dataShard, parityShard [][]byte) error {
+	groupID++
+	var idx uint32
 	for _, shard := range dataShard {
+		binary.BigEndian.PutUint32(shard, (groupID<<8 | idx))
+		idx++
+		if rand.Int31n(13) == 1 {
+			continue
+		}
+		fmt.Println("send", shard)
 		sendN, err := udpConns[0].Write(shard)
 		if err != nil {
 			return err
@@ -120,7 +132,11 @@ func sendData(dataShard, parityShard [][]byte) error {
 			fmt.Printf("data len = %d != send len = %d!", len(shard), sendN)
 		}
 	}
+	fmt.Println("send data shard complete")
 	for _, shard := range parityShard {
+		binary.BigEndian.PutUint32(shard, (groupID<<8 | idx))
+		idx++
+		fmt.Println("send", shard)
 		sendN, err := udpConns[1].Write(shard)
 		if err != nil {
 			return err
@@ -129,6 +145,7 @@ func sendData(dataShard, parityShard [][]byte) error {
 			fmt.Printf("parity len = %d != send len = %d!", len(shard), sendN)
 		}
 	}
+	fmt.Println("send parity shard complete")
 	return nil
 }
 
@@ -179,7 +196,7 @@ func main() {
 	// 创建多个UDP发送通道
 	for _, iface := range interfacesList {
 		srcAddr := &net.UDPAddr{Port: 0}
-		dstAddr := &net.UDPAddr{IP: net.ParseIP("192.168.1.45"), Port: 8080}
+		dstAddr := &net.UDPAddr{IP: net.ParseIP("192.168.1.40"), Port: 8080}
 		if srcIP, ok := ifaceIPMap[iface]; ok {
 			srcAddr.IP = srcIP[0]
 		} else {

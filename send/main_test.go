@@ -10,6 +10,7 @@ import (
 )
 
 func Test_main(t *testing.T) {
+	rand.Seed(time.Now().Unix())
 	srcAddr := &net.UDPAddr{
 		IP:   net.IPv6zero,
 		Port: 0,
