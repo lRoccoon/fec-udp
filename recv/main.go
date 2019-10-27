@@ -7,6 +7,7 @@ import (
 	"reflect"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/klauspost/reedsolomon"
 )
@@ -88,7 +89,7 @@ func cacheFECDecodeData(ch chan []byte) {
 		if !ok {
 			break
 		}
-		// TODO: 读取组内序号
+		// 读取组内序号
 		id := binary.BigEndian.Uint32(tmp[:defaultHeaderLength])
 		idx = id & 0xff
 		newGroupID := (id & 0xffffff00) >> 8
@@ -124,7 +125,7 @@ func cacheFECDecodeData(ch chan []byte) {
 			}
 			// 展示解码后的内容
 			for _, shard := range data {
-				fmt.Println(shard)
+				fmt.Println(shard, time.Now().UnixNano())
 			}
 
 		}

@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/binary"
 	"fmt"
+	"math"
 	"math/rand"
 	"net"
 	"reflect"
@@ -10,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/klauspost/reedsolomon"
 )
@@ -75,8 +77,8 @@ func getInterfacesIPv4() (map[string][]net.IP, error) {
 	return rest, nil
 }
 
-// listenLocal 监听本地端口，并将数据送到缓存中
-func listenLocal(ch chan []byte, localAddr *net.UDPAddr) {
+// listenLocalByUDP 监听本地UDP端口，并将数据送到缓存中
+func listenLocalByUDP(ch chan []byte, localAddr *net.UDPAddr) {
 	listener, err := net.ListenUDP("udp", localAddr)
 	if err != nil {
 		fmt.Printf("listen local addr [%v] error: %v\n", localAddr, err)
@@ -101,8 +103,39 @@ func listenLocal(ch chan []byte, localAddr *net.UDPAddr) {
 	}
 }
 
+// listenLocalByUDP 监听本地UDP端口，并将数据送到缓存中
+func listenLocalByTCP(ch chan []byte, localAddr *net.TCPAddr) {
+	listener, err := net.ListenTCP("tcp", localAddr)
+	if err != nil {
+		fmt.Printf("listen local addr [%v] error: %v\n", localAddr, err)
+		return
+	}
+	fmt.Printf("Local: <%s> \n", listener.Addr().String())
+
+	conn, err := listener.AcceptTCP()
+	if err != nil {
+		fmt.Printf("accept error: %v\n", err)
+		return
+	}
+
+	for {
+		data := make([]byte, defaultMTU)
+		n, err := conn.Read(data)
+		if err != nil {
+			fmt.Printf("error during read tcp: %v\n", err)
+			continue
+		}
+		fmt.Printf("<%s> %d bytes, time:%d\n", conn.RemoteAddr().String(), n, time.Now().UnixNano())
+		select {
+		case ch <- data[:n]:
+			fmt.Println(n, data[:n])
+		default:
+			fmt.Printf("ch is full!\n")
+		}
+	}
+}
+
 func calFEC(data [][]byte, dataShards, parityShards int) ([][]byte, error) {
-	fmt.Println(len(data))
 	enc, err := reedsolomon.New(dataShards, parityShards)
 	if err != nil {
 		return nil, err
@@ -149,38 +182,79 @@ func sendData(dataShard, parityShard [][]byte) error {
 	return nil
 }
 
-// cacheSendData 缓存FEC编码的数据
-func cacheFECEncodeData(ch chan []byte) {
+func resharpData(data [][]byte, n int) (int, [][]byte) {
+	dataSize := 0
+	for i := range data {
+		dataSize += len(data[i])
+	}
+	blockSize := int(math.Ceil(float64(dataSize) / float64(n)))
+	result := make([][]byte, 0, n)
+	block := make([]byte, blockSize+defaultHeaderLength)
+	blockP := defaultHeaderLength
+	dataP := 0
+	for i := range data {
+		for {
+			n := copy(block[blockP:], data[i][dataP:])
+			fmt.Println(blockP, i, dataP)
+			if n < blockSize+defaultHeaderLength-blockP {
+				blockP += n
+				dataP = 0
+				break
+			} else {
+				result = append(result, block)
+				block = make([]byte, blockSize+defaultHeaderLength)
+				blockP = defaultHeaderLength
+				dataP += n
+			}
+		}
+
+	}
+	return blockSize, result
+}
+
+func fecEncodeAndSend(data [][]byte) {
+	// 整里数据
+	blockSize, data := resharpData(data, dataShards)
+	fmt.Printf("block size: %d\n", blockSize)
+	for i := range data {
+		fmt.Println(data[i])
+	}
+	// 开辟冗余空间
+	for i := 0; i < parityShards; i++ {
+		data = append(data, make([]byte, blockSize+defaultHeaderLength))
+	}
+	// FEC计算
+	data, err := calFEC(data, dataShards, parityShards)
+	if err != nil {
+		fmt.Printf("cal FEC error: %v\n", err)
+		return
+	}
+	// 发送数据
+	err = sendData(data[:dataShards], data[dataShards:])
+	if err != nil {
+		fmt.Printf("send data error: %v\n", err)
+		return
+	}
+}
+
+// cacheData 缓存FEC编码的数据
+func cacheData(ch chan []byte) {
 	data := make([][]byte, 0, dataShards+parityShards)
-	var idx int
+	var sum int
 	for {
 		tmp, ok := <-ch
 		if !ok {
 			break
 		}
-		fmt.Println(tmp)
-		data = append(data, tmp)
-		idx = (idx + 1) % dataShards
-		if idx == 0 {
-			go func(data [][]byte) {
-				// 开辟冗余空间
-				for i := 0; i < parityShards; i++ {
-					data = append(data, make([]byte, len(data[0])))
-				}
-				// FEC计算
-				data, err := calFEC(data, dataShards, parityShards)
-				if err != nil {
-					fmt.Printf("cal FEC error: %v\n", err)
-					return
-				}
-				// 发送数据
-				err = sendData(data[:dataShards], data[dataShards:])
-				if err != nil {
-					fmt.Printf("send data error: %v\n", err)
-					return
-				}
-			}(data)
+		if len(tmp) > 0 {
+			fmt.Println(tmp)
+			data = append(data, tmp)
+			sum += len(tmp)
+		}
+		if sum > (defaultMTU*(dataShards-1)) || (len(data) > 0 && len(tmp) == 0) {
+			go fecEncodeAndSend(data)
 			data = make([][]byte, 0, dataShards+parityShards)
+			sum = 0
 		}
 	}
 }
@@ -218,12 +292,24 @@ func main() {
 	ch := make(chan []byte, 100)
 	// 缓存并启动FEC计算
 	go func() {
-		cacheFECEncodeData(ch)
+		cacheData(ch)
 		wg.Done()
+	}()
+
+	go func() {
+		tick := time.Tick(time.Millisecond * 10)
+		for {
+			<-tick
+			select {
+			case ch <- []byte{}:
+			default:
+				fmt.Println("chan is full")
+			}
+		}
 	}()
 	// 创建本地监听端口
 	go func() {
-		listenLocal(ch, &net.UDPAddr{IP: net.IPv4zero, Port: defaultListenPort})
+		listenLocalByTCP(ch, &net.TCPAddr{IP: net.IPv4zero, Port: defaultListenPort})
 		wg.Done()
 	}()
 	wg.Wait()
